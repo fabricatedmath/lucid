@@ -148,6 +148,88 @@ def bilinearly_sampled_image(texture, uv):
     s = s0 * (1.0 - uf) + s1 * uf
     return s
 
+def bilinearly_sampled_image_indices(texture, uv):
+    """Generate indices necessary for bilinearly sampled image
+
+    Intended to run on CPU to index only pixels necessary for gpu based
+    optimization for the uv sampled image.
+
+    This allows a large texture to remain in host memory, only transferring
+    image data necessary for optimization to GPU. This also avoids the pain of
+    writing an inverse bilinear sampling, so we can still backprop through bilinear
+    sampling.
+
+    Indices are intended to be run through tf.gather_nd and tf.scatter_nd (on CPU)
+
+    Coordinate transformation rules match OpenGL GL_REPEAT wrapping and GL_LINEAR
+    interpolation modes.
+
+    Args:
+      texture: [tex_h, tex_w, channel_n] tensor.
+      uv: [frame_h, frame_h, 2] tensor with per-pixel UV coordinates in range [0..1]
+
+    Returns:
+      [frame_h, frame_h, 4, channel_n] tensor with int indices representing
+      corners of the bilinear radius per pixel.
+    """
+    h, w = tf.unstack(tf.shape(texture)[:2])
+    u, v = tf.split(uv, 2, axis=-1)
+    v = 1.0 - v  # vertical flip to match GL convention
+
+    #u = 1.0 - u
+    u, v = u * tf.to_float(w) - 0.5, v * tf.to_float(h) - 0.5
+    u0, u1 = tf.floor(u), tf.ceil(u)
+    v0, v1 = tf.floor(v), tf.ceil(v)
+    uf, vf = u - u0, v - v0
+    u0, u1, v0, v1 = map(tf.to_int32, [u0, u1, v0, v1])
+
+    def sample(u, v):
+        vu = tf.concat([v % h, u % w], axis=-1)
+        return vu
+
+    s00, s01 = sample(u0, v0), sample(u0, v1)
+    s10, s11 = sample(u1, v0), sample(u1, v1)
+    return tf.stack([s00, s01, s10, s11], 2)
+
+def bilinearly_sampled_image_combine_indices(gathered_texture, uv):
+    """Reduces texture generated from gathering indices from
+    'bilinearly_sampled_image_indices'
+
+    Combines this texture by following through on the rest of the bilinear sampling
+    steps. Running this function on the GPU allows backprop back into the
+    gathered_texture on the GPU, which can then be scattered from the CPU onto a
+    large source texture.
+
+    Coordinate transformation rules match OpenGL GL_REPEAT wrapping and GL_LINEAR
+    interpolation modes.
+
+    Args:
+      gathered_texture: [tex_h, tex_w, 4, channel_n] tensor.
+      uv: [frame_h, frame_h, 2] tensor with per-pixel UV coordinates in range [0..1]
+
+    Returns:
+      [frame_h, frame_h, channel_n] tensor with per-pixel sampled values.
+    """
+    h, w = tf.unstack(tf.shape(gathered_texture)[:2])
+    u, v = tf.split(uv, 2, axis=-1)
+    v = 1.0 - v  # vertical flip to match GL convention
+
+    #u = 1.0 - u
+    u, v = u * tf.to_float(w) - 0.5, v * tf.to_float(h) - 0.5
+    u0, u1 = tf.floor(u), tf.ceil(u)
+    v0, v1 = tf.floor(v), tf.ceil(v)
+    uf, vf = u - u0, v - v0
+
+    s00 = gathered_texture[:,:,0,:]
+    s01 = gathered_texture[:,:,1,:]
+    s10 = gathered_texture[:,:,2,:]
+    s11 = gathered_texture[:,:,3,:]
+
+    s0 = s00 * (1.0 - vf) + s01 * vf
+    s1 = s10 * (1.0 - vf) + s11 * vf
+    s = s0 * (1.0 - uf) + s1 * uf
+    return s
+
 
 # Deprecations
 
